@@ -34,6 +34,8 @@ export default function CallPage() {
   const navigate = useNavigate();
   const socket = useSocket();
   const localVideoRef = useRef(null);
+  const localStreamRef = useRef(null);
+  const pendingIce = useRef({});
   const [localStream, setLocalStream] = useState(null);
   const [remoteStreams, setRemoteStreams] = useState({});
   const [participants, setParticipants] = useState([]);
@@ -98,6 +100,7 @@ export default function CallPage() {
   const getUserMedia = async (constraints = mediaConstraints) => {
     try {
       const stream = await navigator.mediaDevices.getUserMedia(constraints);
+      localStreamRef.current = stream;
       setLocalStream(stream);
       
       if (stream.getAudioTracks().length > 0) {
@@ -120,9 +123,9 @@ export default function CallPage() {
       const pc = new RTCPeerConnection(iceServers);
       peerConnections.current[userId] = pc;
 
-      if (localStream) {
-        localStream.getTracks().forEach((track) => {
-          pc.addTrack(track, localStream);
+      if (localStreamRef.current) {
+        localStreamRef.current.getTracks().forEach((track) => {
+          pc.addTrack(track, localStreamRef.current);
         });
       }
 
@@ -151,26 +154,12 @@ export default function CallPage() {
         const state = pc.iceConnectionState;
         console.log(`${userId} ICE state: ${state}`);
         
-        if (state === 'connected') {
+        if (state === 'connected' || state === 'completed') {
           setConnectionStatus('connected');
           retryCount.current = 0;
-        } else if (state === 'disconnected' || state === 'failed') {
-          if (retryCount.current < 3) {
-            retryCount.current += 1;
-            reconnectPeer(userId);
-          } else {
-            handleUserLeft({ userId });
-          }
-        }
-      };
-
-      pc.onnegotiationneeded = async () => {
-        try {
-          const offer = await pc.createOffer();
-          await pc.setLocalDescription(offer);
-          socket.emit('offer', { to: userId, offer });
-        } catch (err) {
-          console.error('Negotiation error:', err);
+        } else if (state === 'failed' || state === 'disconnected') {
+          setConnectionStatus('connecting');
+          console.warn('Peer ICE connection:', userId, state);
         }
       };
 
@@ -178,16 +167,6 @@ export default function CallPage() {
     } catch (error) {
       console.error('Error creating peer connection:', error);
       return null;
-    }
-  };
-
-  const reconnectPeer = (userId) => {
-    const pc = peerConnections.current[userId];
-    if (!pc) return;
-    
-    if (pc.connectionState === 'disconnected' || pc.connectionState === 'failed') {
-      console.log(`Attempting to reconnect to ${userId}`);
-      handleUserJoined({ userId });
     }
   };
 
@@ -207,18 +186,15 @@ export default function CallPage() {
   };
 
   const handleOffer = async ({ sender, offer }) => {
-    if (roomSettings.isLocked && !participants.includes(sender)) {
-      console.log('Room is locked, rejecting connection from', sender);
-      return;
-    }
-
     let pc = peerConnections.current[sender];
     if (!pc) {
       pc = createPeerConnection(sender);
     }
 
     try {
+      if (!pc) return;
       await pc.setRemoteDescription(new RTCSessionDescription(offer));
+      await flushIce(sender, pc);
       const answer = await pc.createAnswer();
       await pc.setLocalDescription(answer);
       socket.emit('answer', { to: sender, answer });
@@ -232,21 +208,31 @@ export default function CallPage() {
     if (pc) {
       try {
         await pc.setRemoteDescription(new RTCSessionDescription(answer));
+        await flushIce(sender, pc);
       } catch (error) {
         console.error('Error handling answer:', error);
       }
     }
   };
 
-  const handleIceCandidate = async ({ sender, candidate }) => {
-    const pc = peerConnections.current[sender];
-    if (pc) {
-      try {
-        await pc.addIceCandidate(new RTCIceCandidate(candidate));
-      } catch (error) {
-        console.error('Error adding ICE candidate:', error);
-      }
+  const flushIce = async (sender, pc) => {
+    const candidates = pendingIce.current[sender] || [];
+    delete pendingIce.current[sender];
+    for (const candidate of candidates) {
+      try { await pc.addIceCandidate(candidate); }
+      catch (error) { console.error('Queued ICE error:', error); }
     }
+  };
+
+  const handleIceCandidate = async ({ sender, candidate }) => {
+    if (!candidate) return;
+    const pc = peerConnections.current[sender];
+    if (!pc || !pc.remoteDescription) {
+      (pendingIce.current[sender] ||= []).push(candidate);
+      return;
+    }
+    try { await pc.addIceCandidate(candidate); }
+    catch (error) { console.error('ICE error:', error); }
   };
 
   const handleUserLeft = ({ userId }) => {
@@ -256,6 +242,7 @@ export default function CallPage() {
       delete peerConnections.current[userId];
     }
     
+    delete pendingIce.current[userId];
     delete analysersRef.current[userId];
     
     setRemoteStreams((prev) => {
@@ -266,13 +253,8 @@ export default function CallPage() {
     
     setParticipants(prev => prev.filter(id => id !== userId));
     
-    if (activeSpeaker === userId) {
-      setActiveSpeaker(null);
-    }
-    
-    if (focusedVideo === userId) {
-      setFocusedVideo(null);
-    }
+    setActiveSpeaker(prev => prev === userId ? null : prev);
+    setFocusedVideo(prev => prev === userId ? null : prev);
   };
 
   const handleEmojiReaction = ({ userId, emoji }) => {
@@ -392,21 +374,22 @@ export default function CallPage() {
   };
 
   const cleanup = () => {
-    if (localStream) {
-      localStream.getTracks().forEach(track => track.stop());
-    }
+    localStreamRef.current?.getTracks().forEach(track => track.stop());
+    localStreamRef.current = null;
     if (screenStreamRef.current) {
       screenStreamRef.current.getTracks().forEach(track => track.stop());
     }
     
     Object.values(peerConnections.current).forEach(pc => pc.close());
     peerConnections.current = {};
+    pendingIce.current = {};
     
     if (animationFrameRef.current) {
       cancelAnimationFrame(animationFrameRef.current);
     }
     if (audioContextRef.current) {
       audioContextRef.current.close();
+      audioContextRef.current = null;
     }
     analysersRef.current = {};
     
@@ -416,33 +399,11 @@ export default function CallPage() {
   };
 
   useEffect(() => {
-    const init = async () => {
-      const stream = await getUserMedia();
-      if (!stream) return;
-
-      socket.emit('join-room', roomId, (response) => {
-        if (response?.error) {
-          alert(response.error);
-          navigate('/');
-          return;
-        }
-        
-        setIsCreator(response.isCreator);
-        if (response.roomSettings) {
-          setRoomSettings(response.roomSettings);
-        }
-        setConnectionStatus('connected');
-        
-        checkSpeakingStatus();
-      });
-    };
-
-    init();
-    return cleanup;
-  }, []);
-
-  useEffect(() => {
-    if (!socket || !localStream) return;
+    if (!socket) return;
+    let cancelled = false;
+    let ready = false;
+    let joined = false;
+    let joining = false;
 
     const eventHandlers = {
       'existing-users': ({ roomUsers, roomSettings }) => {
@@ -450,11 +411,6 @@ export default function CallPage() {
         if (roomSettings) {
           setRoomSettings(roomSettings);
         }
-        roomUsers.forEach(userId => {
-          if (userId !== socket.id && !peerConnections.current[userId]) {
-            handleUserJoined({ userId });
-          }
-        });
       },
       'user-joined': ({ userId, roomUsers }) => {
         setParticipants(prev => {
@@ -485,12 +441,67 @@ export default function CallPage() {
       socket.on(event, handler);
     });
 
-    return () => {
-      Object.keys(eventHandlers).forEach(event => {
-        socket.off(event, eventHandlers[event]);
+    const join = () => {
+      if (cancelled || !ready || !socket.connected || joined || joining) return;
+      joining = true;
+      socket.timeout(15000).emit('join-room', roomId, (error, response) => {
+        joining = false;
+        if (cancelled || !socket.connected) return;
+        if (error || !response) {
+          console.error('Room join timed out:', error);
+          setConnectionStatus('connecting');
+          return;
+        }
+        if (response.error) {
+          alert(response.error);
+          navigate('/');
+          return;
+        }
+        joined = true;
+        if (localStreamRef.current?.getAudioTracks().length) initAudioAnalyser(localStreamRef.current, socket.id);
+        setIsCreator(response.isCreator);
+        if (response.roomSettings) setRoomSettings(response.roomSettings);
+        if (Array.isArray(response.roomUsers)) setParticipants(response.roomUsers);
+        console.log('Room joined:', roomId, response);
+        setConnectionStatus('connected');
+        if (!animationFrameRef.current) checkSpeakingStatus();
       });
     };
-  }, [socket, localStream, roomId, participants]);
+    const disconnected = () => {
+      joined = false;
+      joining = false;
+      Object.values(peerConnections.current).forEach(pc => pc.close());
+      peerConnections.current = {};
+      pendingIce.current = {};
+      setRemoteStreams({});
+      setParticipants([]);
+      setConnectionStatus('connecting');
+    };
+    socket.on('connect', join);
+    socket.on('disconnect', disconnected);
+    (async () => {
+      const stream = await navigator.mediaDevices.getUserMedia(mediaConstraints).catch(error => {
+        console.error('Media error:', error);
+        if (!cancelled) setConnectionStatus('media-error');
+        return null;
+      });
+      if (!stream) return;
+      if (cancelled) { stream.getTracks().forEach(track => track.stop()); return; }
+      localStreamRef.current = stream;
+      setLocalStream(stream);
+      if (localVideoRef.current) localVideoRef.current.srcObject = stream;
+      ready = true;
+      join();
+    })();
+    return () => {
+      cancelled = true;
+      socket.off('connect', join);
+      socket.off('disconnect', disconnected);
+      Object.entries(eventHandlers).forEach(([event, handler]) => socket.off(event, handler));
+      cleanup();
+      animationFrameRef.current = null;
+    };
+  }, [socket, roomId]);
 
   const getVideoClasses = (userId) => {
     if (!focusedVideo) return 'w-full h-full';
